@@ -57,7 +57,7 @@ func setupTestSuite(t *testing.T) *TestSuite {
 		mainnetWSRPC = "wss://api.mainnet-beta.solana.com"
 	}
 
-	isSimulate := false // Default to true unless explicitly "false"
+	isSimulate := true // Default to true unless explicitly "false"
 	if isSimulate {
 		t.Log("Running in SIMULATION mode. No transactions will be sent.")
 	} else {
@@ -69,7 +69,8 @@ func setupTestSuite(t *testing.T) *TestSuite {
 
 	// Initialize router with Orca Whirlpool protocol (same as main.go)
 	testRouter := router.NewSimpleRouter(
-		protocol.NewOrcaWhirlpool(solClient),
+		// protocol.NewOrcaWhirlpool(solClient),
+		protocol.NewRaydiumClmm(solClient),
 	)
 
 	return &TestSuite{
