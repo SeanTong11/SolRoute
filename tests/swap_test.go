@@ -199,7 +199,7 @@ func TestQueryPoolAndSwap(t *testing.T) {
 	require.NoError(t, err, "Failed to get blockhash")
 
 	// Send transaction (this will execute the actual swap)
-	sig, err := ts.solClient.SendTx(ts.ctx, res.Value.Blockhash, signers, instructions, true)
+	sig, err := ts.solClient.SendTx(ts.ctx, res.Value.Blockhash, signers, instructions, ts.simulate)
 	require.NoError(t, err, "Failed to send transaction")
 	require.NotEmpty(t, sig, "Transaction signature should not be empty")
 

@@ -5,6 +5,7 @@ SolRoute is a Go SDK that serves as the fundamental infrastructure for building 
 ## Features
 
 - **Protocol Support**
+
   - Raydium CPMM V4 (`675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8`)
   - Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`)
   - Raydium CLMM (`CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK`)
@@ -19,31 +20,55 @@ SolRoute is a Go SDK that serves as the fundamental infrastructure for building 
   - Transaction instruction building
 
 ## Quick Start
-You run test in /tests to quickly understand the key feature of this project.
 
-note: before swapping, you must ensure that you have create the relavent SPL token account. I have provided some necessary func like: CoverWsol, CloseWsol and SelectOrCreateSPLTokenAccount.
-Youd'd better learn that knowledge from: https://solana.com/zh/developers/cookbook/tokens/get-token-account
+Use the test cases in the `tests` directory to quickly experience pool discovery and swap execution.
 
-```go
-// Initialize router with supported protocols
-router := router.NewSimpleRouter(
-    protocol.NewPumpAmm(solClient),
-    protocol.NewRaydiumAmm(solClient),
-    protocol.NewRaydiumClmm(solClient),
-    protocol.NewRaydiumCpmm(solClient),
-)
+### 1. Installation
 
-// Find best pool and execute swap
-bestPool, amountOut, err := router.GetBestPool(ctx, solClient.RpcClient, 
-    "TOKEN0_MINT", "TOKEN1_MINT", amountIn)
-if err != nil {
-    log.Fatal(err)
-}
-
-// Build and send transaction
-instructions, err := bestPool.BuildSwapInstructions(ctx, solClient.RpcClient,
-    userPublicKey, "TOKEN0_MINT", amountIn, minAmountOut)
+```bash
+go get github.com/Solana-ZH/solroute
 ```
+
+### 2. Environment variables
+
+Config in your system:
+
+```bash
+# Required: private key for signing (base58)
+export SOLANA_PRIVATE_KEY="your_private_key"
+
+# Optional (defaults to mainnet)
+export SOLANA_RPC_URL="https://api.mainnet-beta.solana.com"
+export SOLANA_WS_RPC_URL="wss://api.mainnet-beta.solana.com"
+```
+
+Or config .env in root of project to load variables.
+
+### 3. Run tests
+
+```bash
+# Run all tests
+go test ./tests
+
+# Run swap tests
+
+
+# Run the main flow (pool discovery → quoting → instruction building; simulation by default)
+go test -v ./tests -run TestQueryPoolAndSwap
+go test -v ./tests  -run  TestUSDCToSOLSwap
+go test -v ./tests  -run  TestSOLToUSDCSwap
+
+# Run discovery or quoting only (no transaction submission)
+go test -v ./tests -run TestQueryPoolsOnly
+go test -v ./tests -run TestGetBestQuote
+```
+
+### 4. Test Swap Overview
+
+- Default mode is simulation (`simulate` defaults to `true` in `tests/swap_test.go`); no on-chain tx, instructions are logged and validated only.
+- To send REAL transactions: set `isSimulate = false` in `setupTestSuite` within `tests/swap_test.go`, or pass `false` as the last argument to `SendTx`. Real transactions incur mainnet fees; ensure your wallet has sufficient SOL.
+- Token accounts: relevant SPL token accounts are required before swapping. Helper methods are provided: `CoverWsol`, `CloseWsol`, and `SelectOrCreateSPLTokenAccount`. For background, see the Solana docs:
+  https://solana.com/developers/cookbook/tokens/get-token-account
 
 ## Installation
 
