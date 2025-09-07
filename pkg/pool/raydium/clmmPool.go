@@ -785,7 +785,9 @@ func (pool *CLMMPool) GetRemainAccounts(
 	)
 
 	exTickArrayBitmapAddress := getPdaTickArrayAddress(RAYDIUM_CLMM_PROGRAM_ID, pool.PoolId, tickAarrayStartIndex)
-	allNeededAccounts = append(allNeededAccounts, exTickArrayBitmapAddress)
+	if !exTickArrayBitmapAddress.Equals(firstTickArray) {
+		allNeededAccounts = append(allNeededAccounts, exTickArrayBitmapAddress)
+	}
 
 	return allNeededAccounts, nil
 }
