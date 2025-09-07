@@ -11,6 +11,9 @@ import (
 	"github.com/Solana-ZH/solroute/pkg/sol"
 	"github.com/Solana-ZH/solroute/utils"
 	"github.com/gagliardetto/solana-go"
+	ata "github.com/gagliardetto/solana-go/programs/associated-token-account"
+	computebudget "github.com/gagliardetto/solana-go/programs/compute-budget"
+	"github.com/gagliardetto/solana-go/programs/token"
 	"github.com/gagliardetto/solana-go/rpc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -23,6 +26,10 @@ const (
 	// Swap parameters
 	defaultAmountIn = 1000000 // 1 sol (9 decimals) - same as main.go
 	slippageBps     = 100     // 1% slippage protection
+
+	// Compute Budget configuration
+	computeUnitPrice = 1000   // micro lamports per CU
+	computeUnitLimit = 120_000 // max CUs
 )
 
 type TestSuite struct {
@@ -177,6 +184,13 @@ func TestQueryPoolAndSwap(t *testing.T) {
 	require.NoError(t, err, "Failed to build swap instructions")
 	require.NotEmpty(t, instructions, "Should generate at least one instruction")
 
+	// Prepend compute budget instructions
+	cuPriceIx, err := computebudget.NewSetComputeUnitPriceInstruction(computeUnitPrice).ValidateAndBuild()
+	require.NoError(t, err, "failed to build CU price instruction")
+	cuLimitIx, err := computebudget.NewSetComputeUnitLimitInstruction(computeUnitLimit).ValidateAndBuild()
+	require.NoError(t, err, "failed to build CU limit instruction")
+	instructions = append([]solana.Instruction{cuPriceIx, cuLimitIx}, instructions...)
+
 	t.Logf("Generated swap instructions count: %v", len(instructions))
 
 	// Prepare transaction components
@@ -319,6 +333,13 @@ func TestSOLToUSDCSwap(t *testing.T) {
 	require.NoError(t, err, "Failed to build swap instructions")
 	require.NotEmpty(t, instructions, "Should generate at least one instruction")
 
+	// Prepend compute budget instructions
+	cuPriceIx, err := computebudget.NewSetComputeUnitPriceInstruction(computeUnitPrice).ValidateAndBuild()
+	require.NoError(t, err, "failed to build CU price instruction")
+	cuLimitIx, err := computebudget.NewSetComputeUnitLimitInstruction(computeUnitLimit).ValidateAndBuild()
+	require.NoError(t, err, "failed to build CU limit instruction")
+	instructions = append([]solana.Instruction{cuPriceIx, cuLimitIx}, instructions...)
+
 	t.Logf("Successfully generated %d swap instructions for SOL->USDC", len(instructions))
 
 	if ts.simulate {
@@ -385,6 +406,37 @@ func TestUSDCToSOLSwap(t *testing.T) {
 		ts.privateKey.PublicKey(), usdcTokenAddr, amountInUSDC, minAmountOut)
 	require.NoError(t, err, "Failed to build swap instructions")
 	require.NotEmpty(t, instructions, "Should generate at least one instruction")
+
+	// Ensure WSOL ATA exists for receiving, create if missing
+	wsolATA, _, err := solana.FindAssociatedTokenAddress(ts.privateKey.PublicKey(), sol.WSOL)
+	require.NoError(t, err, "failed to derive WSOL ATA")
+	acctInfo, err := ts.solClient.RpcClient.GetAccountInfo(ts.ctx, wsolATA)
+	if err != nil || acctInfo.Value == nil || acctInfo.Value.Owner.IsZero() {
+		createATAIx, err := ata.NewCreateInstruction(
+			ts.privateKey.PublicKey(),
+			ts.privateKey.PublicKey(),
+			sol.WSOL,
+		).ValidateAndBuild()
+		require.NoError(t, err, "failed to build create WSOL ATA instruction")
+		instructions = append([]solana.Instruction{createATAIx}, instructions...)
+	}
+
+	// Prepend compute budget instructions
+	cuPriceIx, err := computebudget.NewSetComputeUnitPriceInstruction(1000).ValidateAndBuild()
+	require.NoError(t, err, "failed to build CU price instruction")
+	cuLimitIx, err := computebudget.NewSetComputeUnitLimitInstruction(300000).ValidateAndBuild()
+	require.NoError(t, err, "failed to build CU limit instruction")
+	instructions = append([]solana.Instruction{cuPriceIx, cuLimitIx}, instructions...)
+
+	// Append close WSOL ATA to unwrap to native SOL after swap
+	closeIx, err := token.NewCloseAccountInstruction(
+		wsolATA,
+		ts.privateKey.PublicKey(),
+		ts.privateKey.PublicKey(),
+		[]solana.PublicKey{},
+	).ValidateAndBuild()
+	require.NoError(t, err, "failed to build close WSOL ATA instruction")
+	instructions = append(instructions, closeIx)
 
 	t.Logf("Successfully generated %d swap instructions for USDC->SOL", len(instructions))
 
