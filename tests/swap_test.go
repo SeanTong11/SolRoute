@@ -3,9 +3,12 @@ package tests
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 
 	"cosmossdk.io/math"
+	"github.com/Solana-ZH/solroute/pkg/pool/orca"
+	"github.com/Solana-ZH/solroute/pkg/pool/raydium"
 	"github.com/Solana-ZH/solroute/pkg/protocol"
 	"github.com/Solana-ZH/solroute/pkg/router"
 	"github.com/Solana-ZH/solroute/pkg/sol"
@@ -22,6 +25,10 @@ import (
 const (
 	// Token addresses
 	usdcTokenAddr = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+	// usdc on raydium devnet
+	dUsdcTokenAddr = "USDCoctVLVnvTXBEuP9s8hntucdJokbo17RwHuNXemT"
+	// usdc on whirlpool devnet
+	devUsdcTokenAddr = "BRjpCHtyQLNCo8gqRUr8jtdAj5AjPYQaoqbvcZiHok1k"
 
 	// Swap parameters
 	defaultAmountIn = 1000000 // 1 sol (9 decimals) - same as main.go
@@ -38,6 +45,17 @@ type TestSuite struct {
 	solClient  *sol.Client
 	router     *router.SimpleRouter
 	simulate   bool
+	rpcURL     string
+	wsURL      string
+	cluster    string
+}
+
+// solscanTxURL builds explorer link with cluster suffix from the suite runtime cluster.
+func (ts *TestSuite) solscanTxURL(sig string) string {
+    if ts.cluster != "" && ts.cluster != "mainnet" {
+        return "https://solscan.io/tx/" + sig + "?cluster=" + ts.cluster
+    }
+    return "https://solscan.io/tx/" + sig
 }
 
 // setupTestSuite initializes test environment and creates Solana client
@@ -54,14 +72,36 @@ func setupTestSuite(t *testing.T) *TestSuite {
 	ctx := context.Background()
 
 	// Get RPC endpoints from environment variables
-	mainnetRPC := os.Getenv("SOLANA_RPC_URL")
-	if mainnetRPC == "" {
-		mainnetRPC = "https://api.mainnet-beta.solana.com"
+	rpcUrl := os.Getenv("SOLANA_RPC_URL")
+	if rpcUrl == "" {
+		rpcUrl = "https://api.mainnet-beta.solana.com"
 	}
 
-	mainnetWSRPC := os.Getenv("SOLANA_WS_RPC_URL")
-	if mainnetWSRPC == "" {
-		mainnetWSRPC = "wss://api.mainnet-beta.solana.com"
+	wsRpcUrl := os.Getenv("SOLANA_WS_RPC_URL")
+	if wsRpcUrl == "" {
+		wsRpcUrl = "wss://api.mainnet-beta.solana.com"
+	}
+
+	// Enforce RPC and WS belong to the same cluster
+	detectCluster := func(u string) string {
+		u = strings.ToLower(u)
+		if strings.Contains(u, "devnet") {
+			return "devnet"
+		}
+		if strings.Contains(u, "testnet") {
+			return "testnet"
+		}
+		return "mainnet"
+	}
+
+	rpcCluster := detectCluster(rpcUrl)
+	wsCluster := detectCluster(wsRpcUrl)
+	require.Equal(t, rpcCluster, wsCluster, "RPC URL and WS URL clusters must match (got %s vs %s)", rpcCluster, wsCluster)
+
+	// If devnet, override program IDs for Raydium CLMM and Orca Whirlpool
+	if rpcCluster == "devnet" {
+		raydium.RAYDIUM_CLMM_PROGRAM_ID = raydium.RAYDIUM_CLMM_DEVNET_PROGRAM_ID
+		orca.ORCA_WHIRLPOOL_PROGRAM_ID = orca.ORCA_WHIRLPOOL_DEVNET_PROGRAM_ID
 	}
 
 	isSimulate := true // Default to true unless explicitly "false"
@@ -71,7 +111,7 @@ func setupTestSuite(t *testing.T) *TestSuite {
 		t.Log("Running in LIVE mode. Transactions will be sent.")
 	}
 
-	solClient, err := sol.NewClient(ctx, mainnetRPC, mainnetWSRPC)
+	solClient, err := sol.NewClient(ctx, rpcUrl, wsRpcUrl)
 	require.NoError(t, err, "Failed to create solana client")
 
 	// Initialize router with Orca Whirlpool protocol (same as main.go)
@@ -86,6 +126,9 @@ func setupTestSuite(t *testing.T) *TestSuite {
 		solClient:  solClient,
 		router:     testRouter,
 		simulate:   isSimulate,
+		rpcURL:     rpcUrl,
+		wsURL:      wsRpcUrl,
+		cluster:    rpcCluster,
 	}
 }
 
@@ -203,7 +246,7 @@ func TestQueryPoolAndSwap(t *testing.T) {
 	require.NoError(t, err, "Failed to send transaction")
 	require.NotEmpty(t, sig, "Transaction signature should not be empty")
 
-	t.Logf("Transaction successful: https://solscan.io/tx/%v", sig)
+	t.Logf("Transaction successful: %s", ts.solscanTxURL(sig.String()))
 }
 
 // TestQueryPoolsOnly tests pool discovery without executing swap
@@ -361,7 +404,7 @@ func TestSOLToUSDCSwap(t *testing.T) {
 	require.NoError(t, err, "Failed to send transaction")
 	require.NotEmpty(t, sig, "Transaction signature should not be empty")
 
-	t.Logf("Transaction successful: https://solscan.io/tx/%v", sig)
+	t.Logf("Transaction successful: %s", ts.solscanTxURL(sig.String()))
 }
 
 // TestUSDCToSOLSwap tests USDC->SOL swap (the working direction)
@@ -455,7 +498,7 @@ func TestUSDCToSOLSwap(t *testing.T) {
 	require.NoError(t, err, "Failed to send transaction")
 	require.NotEmpty(t, sig, "Transaction signature should not be empty")
 
-	t.Logf("Transaction successful: https://solscan.io/tx/%v", sig)
+	t.Logf("Transaction successful: %s", ts.solscanTxURL(sig.String()))
 }
 
 // TestSOLPriceCalculation specifically tests SOL price calculation accuracy
