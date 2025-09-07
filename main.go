@@ -3,21 +3,18 @@ package main
 import (
 	"context"
 	"log"
+	"os"
 
 	"cosmossdk.io/math"
 	"github.com/Solana-ZH/solroute/pkg/protocol"
 	"github.com/Solana-ZH/solroute/pkg/router"
 	"github.com/Solana-ZH/solroute/pkg/sol"
+	"github.com/Solana-ZH/solroute/utils"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
 )
 
 const (
-	privateKeyStr = ""
-	// RPC endpoints
-	mainnetRPC   = ""
-	mainnetWSRPC = ""
-
 	// Token addresses
 	usdcTokenAddr = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
@@ -26,12 +23,30 @@ const (
 	slippageBps     = 100        // 1% slippage
 )
 
+
 func main() {
-	// TODO: Initialize private key from environment or config file
+	// Load .env if present
+	utils.LoadEnv()
+
+	// Initialize private key from environment
+	privateKeyStr := os.Getenv("SOLANA_PRIVATE_KEY")
+	if privateKeyStr == "" {
+		log.Fatalf("SOLANA_PRIVATE_KEY is required")
+	}
 	privateKey := solana.MustPrivateKeyFromBase58(privateKeyStr)
 	log.Printf("PublicKey: %v", privateKey.PublicKey())
 
 	ctx := context.Background()
+	// RPC endpoints from env (with defaults)
+	mainnetRPC := os.Getenv("SOLANA_RPC_URL")
+	if mainnetRPC == "" {
+		mainnetRPC = "https://api.mainnet-beta.solana.com"
+	}
+	mainnetWSRPC := os.Getenv("SOLANA_WS_RPC_URL")
+	if mainnetWSRPC == "" {
+		mainnetWSRPC = "wss://api.mainnet-beta.solana.com"
+	}
+
 	solClient, err := sol.NewClient(ctx, mainnetRPC, mainnetWSRPC)
 	if err != nil {
 		log.Fatalf("Failed to create solana client: %v", err)

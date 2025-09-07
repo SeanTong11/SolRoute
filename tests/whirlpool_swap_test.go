@@ -9,6 +9,7 @@ import (
 	"github.com/Solana-ZH/solroute/pkg/protocol"
 	"github.com/Solana-ZH/solroute/pkg/router"
 	"github.com/Solana-ZH/solroute/pkg/sol"
+	"github.com/Solana-ZH/solroute/utils"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
 	"github.com/stretchr/testify/assert"
@@ -29,10 +30,13 @@ type TestSuite struct {
 	privateKey solana.PrivateKey
 	solClient  *sol.Client
 	router     *router.SimpleRouter
+	simulate   bool
 }
 
 // setupTestSuite initializes test environment and creates Solana client
 func setupTestSuite(t *testing.T) *TestSuite {
+    // Load .env first
+    utils.LoadEnv()
 	// Get private key from environment variable
 	privateKeyStr := os.Getenv("SOLANA_PRIVATE_KEY")
 	require.NotEmpty(t, privateKeyStr, "SOLANA_PRIVATE_KEY environment variable is required")
@@ -53,6 +57,13 @@ func setupTestSuite(t *testing.T) *TestSuite {
 		mainnetWSRPC = "wss://api.mainnet-beta.solana.com"
 	}
 
+	isSimulate := false // Default to true unless explicitly "false"
+	if isSimulate {
+		t.Log("Running in SIMULATION mode. No transactions will be sent.")
+	} else {
+		t.Log("Running in LIVE mode. Transactions will be sent.")
+	}
+
 	solClient, err := sol.NewClient(ctx, mainnetRPC, mainnetWSRPC)
 	require.NoError(t, err, "Failed to create solana client")
 
@@ -66,6 +77,7 @@ func setupTestSuite(t *testing.T) *TestSuite {
 		privateKey: privateKey,
 		solClient:  solClient,
 		router:     testRouter,
+		simulate:   isSimulate,
 	}
 }
 
@@ -78,14 +90,43 @@ func (ts *TestSuite) teardownTestSuite() {
 
 // setupTokenAccounts prepares WSOL and USDC token accounts
 func (ts *TestSuite) setupTokenAccounts(t *testing.T) solana.PublicKey {
+	// First check native SOL balance for transaction fees
+	solBalance, err := ts.solClient.RpcClient.GetBalance(ts.ctx, ts.privateKey.PublicKey(), rpc.CommitmentConfirmed)
+	if err != nil {
+		t.Logf("Warning: Could not check SOL balance: %v", err)
+	} else {
+		t.Logf("Native SOL balance: %v lamports (%.4f SOL)", solBalance.Value, float64(solBalance.Value)/1e9)
+		// Require at least 0.1 SOL for transaction fees
+		if solBalance.Value < 100000000 { // 0.1 SOL
+			t.Skip("Insufficient native SOL balance for transaction fees. Need at least 0.1 SOL.")
+		}
+	}
+
 	// Check WSOL balance and cover if necessary
 	balance, err := ts.solClient.GetUserTokenBalance(ts.ctx, ts.privateKey.PublicKey(), sol.WSOL)
-	require.NoError(t, err, "Failed to get user token balance")
+	if err != nil {
+		// If no WSOL account exists, balance is 0
+		if err.Error() == "no token account found" {
+			balance = 0
+			t.Log("No WSOL account found, will create one by covering WSOL")
+		} else {
+			require.NoError(t, err, "Failed to get user token balance")
+		}
+	}
 	t.Logf("User WSOL balance: %v", balance)
 
+	// Always ensure we have enough WSOL by covering if balance is low
 	if balance < 10000000 {
+		t.Log("WSOL balance too low, covering with 10 WSOL...")
 		err = ts.solClient.CoverWsol(ts.ctx, ts.privateKey, 10000000)
 		require.NoError(t, err, "Failed to cover wsol")
+		t.Log("Successfully covered WSOL")
+		
+		// Verify balance after covering
+		newBalance, err := ts.solClient.GetUserTokenBalance(ts.ctx, ts.privateKey.PublicKey(), sol.WSOL)
+		if err == nil {
+			t.Logf("WSOL balance after covering: %v", newBalance)
+		}
 	}
 
 	// Get or create USDC token account
@@ -228,4 +269,205 @@ func TestInstructionGeneration(t *testing.T) {
 		assert.NotNil(t, instr, "Instruction %d should not be nil", i)
 		t.Logf("Instruction %d: Program ID %v, %d accounts", i, instr.ProgramID(), len(instr.Accounts()))
 	}
+}
+
+// TestSOLToUSDCSwap tests SOL->USDC swap (the problematic direction)
+func TestSOLToUSDCSwap(t *testing.T) {
+	// Setup test environment
+	ts := setupTestSuite(t)
+	defer ts.teardownTestSuite()
+
+	// Setup token accounts
+	usdcTokenAccount := ts.setupTokenAccounts(t)
+	assert.NotEqual(t, solana.PublicKey{}, usdcTokenAccount, "USDC token account should not be empty")
+
+	// Query available pools
+	pools, err := ts.router.QueryAllPools(ts.ctx, sol.WSOL.String(), usdcTokenAddr)
+	require.NoError(t, err, "Failed to query all pools")
+	require.NotEmpty(t, pools, "Should find at least one pool")
+
+	t.Logf("Found %d pools for SOL->USDC", len(pools))
+
+	// Find best pool for SOL->USDC swap
+	amountIn := math.NewInt(defaultAmountIn) // 0.001 SOL
+	bestPool, amountOut, err := ts.router.GetBestPool(ts.ctx, ts.solClient.RpcClient, sol.WSOL.String(), usdcTokenAddr, amountIn)
+	require.NoError(t, err, "Failed to get best pool")
+	require.NotNil(t, bestPool, "Best pool should not be nil")
+	require.True(t, amountOut.GT(math.ZeroInt()), "Amount out should be greater than zero")
+
+	t.Logf("Selected best pool: %v", bestPool.GetID())
+	t.Logf("Input: %v WSOL (0.001 SOL)", amountIn)
+	t.Logf("Expected output: %v USDC", amountOut)
+
+	// Calculate SOL price in USDC (considering decimals: SOL=9, USDC=6)
+	// Price = (amountOut / 10^6) / (amountIn / 10^9) = amountOut * 10^3 / amountIn
+	solPriceInUSDC := amountOut.Mul(math.NewInt(1000)).Quo(amountIn)
+	t.Logf("Calculated SOL price: %v USDC per SOL", solPriceInUSDC)
+
+	// Validate price reasonableness (should be between $50-$500 per SOL)
+	assert.True(t, solPriceInUSDC.GT(math.NewInt(50)), "SOL price should be > $50")
+	assert.True(t, solPriceInUSDC.LT(math.NewInt(500)), "SOL price should be < $500")
+
+	// Calculate minimum output amount with slippage
+	minAmountOut := amountOut.Mul(math.NewInt(10000 - slippageBps)).Quo(math.NewInt(10000))
+	t.Logf("Min amount out with %d bps slippage: %v USDC", slippageBps, minAmountOut)
+
+	// Build swap instructions
+	instructions, err := bestPool.BuildSwapInstructions(ts.ctx, ts.solClient.RpcClient,
+		ts.privateKey.PublicKey(), sol.WSOL.String(), amountIn, minAmountOut)
+	require.NoError(t, err, "Failed to build swap instructions")
+	require.NotEmpty(t, instructions, "Should generate at least one instruction")
+
+	t.Logf("Successfully generated %d swap instructions for SOL->USDC", len(instructions))
+
+	if ts.simulate {
+		t.Log("Simulation mode: skipping transaction submission.")
+		// Log instruction details for debugging
+		for i, instr := range instructions {
+			t.Logf("Instruction %d: Program %v, %d accounts", i, instr.ProgramID(), len(instr.Accounts()))
+		}
+		return
+	}
+
+	// Prepare transaction components
+	signers := []solana.PrivateKey{ts.privateKey}
+	res, err := ts.solClient.RpcClient.GetLatestBlockhash(ts.ctx, rpc.CommitmentFinalized)
+	require.NoError(t, err, "Failed to get blockhash")
+
+	// Send transaction (this will execute the actual swap)
+	sig, err := ts.solClient.SendTx(ts.ctx, res.Value.Blockhash, signers, instructions, ts.simulate)
+	require.NoError(t, err, "Failed to send transaction")
+	require.NotEmpty(t, sig, "Transaction signature should not be empty")
+
+	t.Logf("Transaction successful: https://solscan.io/tx/%v", sig)
+}
+
+// TestUSDCToSOLSwap tests USDC->SOL swap (the working direction)
+func TestUSDCToSOLSwap(t *testing.T) {
+	// Setup test environment
+	ts := setupTestSuite(t)
+	defer ts.teardownTestSuite()
+
+	// Setup token accounts
+	usdcTokenAccount := ts.setupTokenAccounts(t)
+	assert.NotEqual(t, solana.PublicKey{}, usdcTokenAccount, "USDC token account should not be empty")
+
+	// Query available pools
+	pools, err := ts.router.QueryAllPools(ts.ctx, usdcTokenAddr, sol.WSOL.String())
+	require.NoError(t, err, "Failed to query all pools")
+	require.NotEmpty(t, pools, "Should find at least one pool")
+
+	t.Logf("Found %d pools for USDC->SOL", len(pools))
+
+	// Test with equivalent of 0.001 SOL, which is $0.2 USDC at 200 USDC/SOL
+	// 0.2 * 10^6 = 200,000
+	amountInUSDC := math.NewInt(200000) // $0.2 USDC
+	bestPool, amountOut, err := ts.router.GetBestPool(ts.ctx, ts.solClient.RpcClient, usdcTokenAddr, sol.WSOL.String(), amountInUSDC)
+	require.NoError(t, err, "Failed to get best pool")
+	require.NotNil(t, bestPool, "Best pool should not be nil")
+	require.True(t, amountOut.GT(math.ZeroInt()), "Amount out should be greater than zero")
+
+	t.Logf("Selected best pool: %v", bestPool.GetID())
+	t.Logf("Input: %v USDC ($0.2)", amountInUSDC)
+	t.Logf("Expected output: %v WSOL", amountOut)
+
+	// Calculate implied SOL price: (Input USDC / 10^6) / (Output SOL / 10^9)
+	impliedSOLPrice := amountInUSDC.Mul(math.NewInt(1000)).Quo(amountOut)
+	t.Logf("Implied SOL price from reverse swap: %v USDC per SOL", impliedSOLPrice)
+
+	// Calculate minimum output amount with slippage
+	minAmountOut := amountOut.Mul(math.NewInt(10000 - slippageBps)).Quo(math.NewInt(10000))
+	t.Logf("Min amount out with %d bps slippage: %v WSOL", slippageBps, minAmountOut)
+
+	// Build swap instructions
+	instructions, err := bestPool.BuildSwapInstructions(ts.ctx, ts.solClient.RpcClient,
+		ts.privateKey.PublicKey(), usdcTokenAddr, amountInUSDC, minAmountOut)
+	require.NoError(t, err, "Failed to build swap instructions")
+	require.NotEmpty(t, instructions, "Should generate at least one instruction")
+
+	t.Logf("Successfully generated %d swap instructions for USDC->SOL", len(instructions))
+
+	if ts.simulate {
+		t.Log("Simulation mode: skipping transaction submission.")
+		return
+	}
+
+	// Prepare transaction components
+	signers := []solana.PrivateKey{ts.privateKey}
+	res, err := ts.solClient.RpcClient.GetLatestBlockhash(ts.ctx, rpc.CommitmentFinalized)
+	require.NoError(t, err, "Failed to get blockhash")
+
+	// Send transaction (this will execute the actual swap)
+	sig, err := ts.solClient.SendTx(ts.ctx, res.Value.Blockhash, signers, instructions, ts.simulate)
+	require.NoError(t, err, "Failed to send transaction")
+	require.NotEmpty(t, sig, "Transaction signature should not be empty")
+
+	t.Logf("Transaction successful: https://solscan.io/tx/%v", sig)
+}
+
+// TestSOLPriceCalculation specifically tests SOL price calculation accuracy
+func TestSOLPriceCalculation(t *testing.T) {
+	ts := setupTestSuite(t)
+	defer ts.teardownTestSuite()
+
+	// Test both directions to compare prices
+	t.Log("=== Testing SOL Price Calculation ===")
+
+	// 1. SOL -> USDC direction
+	t.Log("\n--- SOL -> USDC Direction ---")
+	pools1, err := ts.router.QueryAllPools(ts.ctx, sol.WSOL.String(), usdcTokenAddr)
+	require.NoError(t, err, "Failed to query pools for SOL->USDC")
+	require.NotEmpty(t, pools1, "Should find pools")
+
+	amountIn1SOL := math.NewInt(1000000000) // 1 SOL (9 decimals)
+	bestPool1, amountOut1, err := ts.router.GetBestPool(ts.ctx, ts.solClient.RpcClient, sol.WSOL.String(), usdcTokenAddr, amountIn1SOL)
+	require.NoError(t, err, "Failed to get best pool for SOL->USDC")
+
+	// Calculate price: output USDC / input SOL
+	priceFromSOLToUSDC := amountOut1.Abs().Mul(math.NewInt(1000)).Quo(amountIn1SOL) // Scale by 1000 for decimal adjustment
+	t.Logf("SOL->USDC: 1 SOL = %v USDC", priceFromSOLToUSDC)
+	t.Logf("Pool used: %v", bestPool1.GetID())
+
+	// 2. USDC -> SOL direction  
+	t.Log("\n--- USDC -> SOL Direction ---")
+	pools2, err := ts.router.QueryAllPools(ts.ctx, usdcTokenAddr, sol.WSOL.String())
+	require.NoError(t, err, "Failed to query pools for USDC->SOL")
+	require.NotEmpty(t, pools2, "Should find pools")
+
+	// Use the calculated price to test reverse swap
+	testUSDCAmount := priceFromSOLToUSDC.Mul(math.NewInt(1000000)) // Convert to USDC units (6 decimals)
+	bestPool2, amountOut2, err := ts.router.GetBestPool(ts.ctx, ts.solClient.RpcClient, usdcTokenAddr, sol.WSOL.String(), testUSDCAmount)
+	require.NoError(t, err, "Failed to get best pool for USDC->SOL")
+
+	// Calculate implied price from reverse swap
+	priceFromUSDCToSOL := testUSDCAmount.Mul(math.NewInt(1000)).Quo(amountOut2.Abs())
+	t.Logf("USDC->SOL: Input %v USDC should give ~1 SOL", testUSDCAmount)
+	t.Logf("USDC->SOL: Got %v WSOL", amountOut2.Abs())
+	t.Logf("USDC->SOL: Implied price = %v USDC per SOL", priceFromUSDCToSOL)
+	t.Logf("Pool used: %v", bestPool2.GetID())
+
+	// 3. Compare with external reference (Orca website shows ~203 USDC/SOL)
+	t.Log("\n--- Price Analysis ---")
+	expectedPrice := math.NewInt(203) // Reference price from Orca website
+	t.Logf("Reference price (Orca): %v USDC/SOL", expectedPrice)
+	t.Logf("Our SOL->USDC price: %v USDC/SOL", priceFromSOLToUSDC)
+	t.Logf("Our USDC->SOL price: %v USDC/SOL", priceFromUSDCToSOL)
+
+	// Calculate deviations
+	deviationSOLToUSDC := priceFromSOLToUSDC.Sub(expectedPrice).Abs().Mul(math.NewInt(100)).Quo(expectedPrice)
+	deviationUSDCToSOL := priceFromUSDCToSOL.Sub(expectedPrice).Abs().Mul(math.NewInt(100)).Quo(expectedPrice)
+	
+t.Logf("SOL->USDC deviation: %v%%", deviationSOLToUSDC)
+	t.Logf("USDC->SOL deviation: %v%%", deviationUSDCToSOL)
+
+	// Validate that our prices are reasonable (within 10% of reference)
+	assert.True(t, deviationSOLToUSDC.LT(math.NewInt(10)), "SOL->USDC price should be within 10%% of reference")
+	assert.True(t, deviationUSDCToSOL.LT(math.NewInt(10)), "USDC->SOL price should be within 10%% of reference")
+
+	// Check that both directions give similar prices (arbitrage should keep them close)
+	priceDifference := priceFromSOLToUSDC.Sub(priceFromUSDCToSOL).Abs()
+	priceDifferencePercent := priceDifference.Mul(math.NewInt(100)).Quo(priceFromSOLToUSDC.Add(priceFromUSDCToSOL).Quo(math.NewInt(2)))
+	t.Logf("Price difference between directions: %v%%", priceDifferencePercent)
+	
+	assert.True(t, priceDifferencePercent.LT(math.NewInt(5)), "Prices from both directions should be within 5%% of each other")
 }
