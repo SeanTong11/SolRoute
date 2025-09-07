@@ -29,10 +29,11 @@ const (
 	U64Resolution                   = 64
 )
 
-// Price Constants - Reuse CLMM price limit constants
+// Price Constants - Based on Whirlpool protocol official values
+// Reference: whirlpools/programs/whirlpool/src/math/tick_math.rs
 var (
 	MIN_SQRT_PRICE_X64    = math.NewIntFromBigInt(big.NewInt(4295048016))
-	MAX_SQRT_PRICE_X64, _ = math.NewIntFromString("79226673521066979257578248091")
+	MAX_SQRT_PRICE_X64, _ = math.NewIntFromString("79226673515401279992447579055")
 	FEE_RATE_DENOMINATOR  = math.NewInt(int64(1000000))
 )
 

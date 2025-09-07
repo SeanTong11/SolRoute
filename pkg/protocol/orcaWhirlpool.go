@@ -68,7 +68,26 @@ func (p *OrcaWhirlpoolProtocol) FetchPoolsByPair(ctx context.Context, baseMint s
 		}
 		layout.PoolId = v.Pubkey
 
-		// TODO: Add here if need to get other configuration info (like fee rates)
+		// Add pool quality checks similar to CLMM's IsSwapEnabled check
+		// Filter out unhealthy pools at search time to prevent selection of problematic pools
+		if healthy, err := layout.IsHealthy(); !healthy {
+			// Log the reason but don't fail completely - just skip this pool
+			fmt.Printf("Skipping unhealthy pool %s: %v\n", layout.PoolId.String(), err)
+			continue
+		}
+
+		// Basic pool state validation before adding to results
+		if err := layout.ValidatePoolState(); err != nil {
+			fmt.Printf("Skipping invalid pool %s: %v\n", layout.PoolId.String(), err)
+			continue
+		}
+
+		// Critical tick array validation at search time to prevent 6038 errors
+		// Check for missing tick arrays that would definitely cause transaction failures
+		if err := p.validateCriticalTickArrays(ctx, layout); err != nil {
+			fmt.Printf("Skipping pool with critical tick array issues %s: %v\n", layout.PoolId.String(), err)
+			continue
+		}
 
 		res = append(res, layout)
 	}
@@ -145,4 +164,130 @@ func (p *OrcaWhirlpoolProtocol) FetchPoolByID(ctx context.Context, poolId string
 	layout.PoolId = poolIdKey
 
 	return layout, nil
+}
+
+// validatePoolTickArrays validates pool's tick array integrity to prevent 6038 errors
+func (p *OrcaWhirlpoolProtocol) validatePoolTickArrays(ctx context.Context, pool *orca.WhirlpoolPool) error {
+	// Check both directions (A->B and B->A) to ensure tick arrays are valid
+	directions := []bool{true, false}
+	
+	for _, aToB := range directions {
+		// Get required tick array addresses
+		tickArray0, tickArray1, tickArray2, err := orca.DeriveMultipleWhirlpoolTickArrayPDAs(
+			pool.PoolId,
+			int64(pool.TickCurrentIndex),
+			int64(pool.TickSpacing),
+			aToB,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to derive tick array PDAs: %w", err)
+		}
+		
+		// Check if primary tick array exists and is valid
+		tickArrayAddrs := []solana.PublicKey{tickArray0, tickArray1, tickArray2}
+		results, err := p.SolClient.RpcClient.GetMultipleAccountsWithOpts(ctx, tickArrayAddrs, &rpc.GetMultipleAccountsOpts{
+			Commitment: rpc.CommitmentProcessed,
+		})
+		if err != nil {
+			// If we can't query tick arrays, it's better to skip this pool
+			return fmt.Errorf("failed to query tick arrays: %w", err)
+		}
+		
+		// At least the first tick array must exist
+		if results.Value[0] == nil {
+			return fmt.Errorf("primary tick array missing for direction aToB=%v", aToB)
+		}
+		
+		// Try to decode the primary tick array to ensure it's valid
+		tickArray := &orca.WhirlpoolTickArray{}
+		if err := tickArray.Decode(results.Value[0].Data.GetBinary()); err != nil {
+			return fmt.Errorf("invalid tick array data: %w", err)
+		}
+		
+		// Basic sanity check on tick array data
+		if err := p.validateTickArraySanity(tickArray, pool); err != nil {
+			return fmt.Errorf("tick array failed sanity check: %w", err)
+		}
+	}
+	
+	return nil
+}
+
+// validateTickArraySanity performs basic sanity checks on tick array data
+func (p *OrcaWhirlpoolProtocol) validateTickArraySanity(tickArray *orca.WhirlpoolTickArray, pool *orca.WhirlpoolPool) error {
+	// Check for abnormally large liquidity_net values that could cause underflow
+	for i, tick := range tickArray.Ticks {
+		if tick.LiquidityNet < -1e15 { // Much stricter threshold than in IsHealthy
+			return fmt.Errorf("tick %d has abnormal liquidity_net: %d", i, tick.LiquidityNet)
+		}
+		// Also check for suspiciously large positive values
+		if tick.LiquidityNet > 1e15 {
+			return fmt.Errorf("tick %d has suspiciously large liquidity_net: %d", i, tick.LiquidityNet)
+		}
+	}
+	
+	return nil
+}
+
+// validateCriticalTickArrays performs essential tick array validations to prevent 6038 errors
+// Checks both directions and all required tick arrays to catch missing arrays
+func (p *OrcaWhirlpoolProtocol) validateCriticalTickArrays(ctx context.Context, pool *orca.WhirlpoolPool) error {
+	// Check both directions to catch missing arrays that would cause 6038 errors
+	directions := []bool{true, false} // A->B and B->A
+	
+	for _, aToB := range directions {
+		// Get required tick array addresses
+		tickArray0, tickArray1, tickArray2, err := orca.DeriveMultipleWhirlpoolTickArrayPDAs(
+			pool.PoolId,
+			int64(pool.TickCurrentIndex),
+			int64(pool.TickSpacing),
+			aToB,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to derive tick array PDAs for direction aToB=%v: %w", aToB, err)
+		}
+		
+		// Check all three tick arrays - missing arrays are the main cause of 6038 errors
+		tickArrayAddrs := []solana.PublicKey{tickArray0, tickArray1, tickArray2}
+		results, err := p.SolClient.RpcClient.GetMultipleAccountsWithOpts(ctx, tickArrayAddrs, &rpc.GetMultipleAccountsOpts{
+			Commitment: rpc.CommitmentProcessed,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to query tick arrays for direction aToB=%v: %w", aToB, err)
+		}
+		
+		// Primary tick array must exist
+		if results.Value[0] == nil {
+			return fmt.Errorf("primary tick array missing for direction aToB=%v", aToB)
+		}
+		
+		// For proper swap execution, we need at least the first two tick arrays
+		// Missing tick array 1 or 2 often causes 6038 errors
+		missingArrays := 0
+		for i := 1; i < len(results.Value); i++ {
+			if results.Value[i] == nil {
+				missingArrays++
+			}
+		}
+		
+		// If more than one tick array is missing, this pool is problematic
+		if missingArrays > 1 {
+			return fmt.Errorf("too many missing tick arrays (%d) for direction aToB=%v", missingArrays, aToB)
+		}
+		
+		// Try to decode the primary tick array to ensure it's valid
+		tickArray := &orca.WhirlpoolTickArray{}
+		if err := tickArray.Decode(results.Value[0].Data.GetBinary()); err != nil {
+			return fmt.Errorf("primary tick array corrupted for direction aToB=%v: %w", aToB, err)
+		}
+		
+		// Check for extremely problematic liquidity values that cause underflow
+		for _, tick := range tickArray.Ticks {
+			if tick.LiquidityNet < -1e18 {
+				return fmt.Errorf("tick array has critically bad liquidity_net: %d for direction aToB=%v", tick.LiquidityNet, aToB)
+			}
+		}
+	}
+	
+	return nil
 }

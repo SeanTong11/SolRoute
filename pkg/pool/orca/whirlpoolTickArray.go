@@ -284,54 +284,105 @@ func DeriveWhirlpoolTickArrayPDA(whirlpoolPubkey solana.PublicKey, startTickInde
 	return pda, nil
 }
 
-// DeriveMultipleWhirlpoolTickArrayPDAs derives multiple tick array PDA addresses
-// Used for tick_array0, tick_array1, tick_array2 needed in swap instructions
-// Implements correct tick array sequence calculation based on Whirlpool source code
-func DeriveMultipleWhirlpoolTickArrayPDAs(whirlpoolPubkey solana.PublicKey, currentTick int64, tickSpacing int64, aToB bool) (tickArray0, tickArray1, tickArray2 solana.PublicKey, err error) {
-	// 1. Based on Whirlpool source code get_start_tick_indexes function implementation
-	tickCurrentIndex := int32(currentTick)
-	tickSpacingI32 := int32(tickSpacing)
-	ticksInArray := TICK_ARRAY_SIZE * tickSpacingI32 // TICK_ARRAY_SIZE = 88
-
-	// 2. Calculate start_tick_index_base (floor division)
-	startTickIndexBase := floorDivision(tickCurrentIndex, ticksInArray) * ticksInArray
-
-	// 3. Calculate offset based on swap direction
-	var offsets []int32
-	if aToB {
-		// A -> B: price decreases, need current and previous tick arrays
-		offsets = []int32{0, -1, -2}
+// getOfficialTickArrayStartIndex implements official Whirlpool TickUtil.getStartTickIndex
+// Reference: whirlpools/legacy-sdk/whirlpool/src/utils/public/tick-utils.ts:58
+func getOfficialTickArrayStartIndex(tickIndex int64, tickSpacing int64, offset int64) (int64, error) {
+	// Use precise integer division to match JavaScript Math.floor behavior
+	// JavaScript Math.floor(-1.1) = -2, Go math.Floor(-1.1) = -2.0
+	dividend := tickIndex
+	divisor := tickSpacing * TICK_ARRAY_SIZE
+	
+	var realIndex int64
+	if dividend >= 0 {
+		realIndex = dividend / divisor
 	} else {
-		// B -> A: price increases, need current and subsequent tick arrays
-		// Check if already crossed to next tick array
-		shifted := tickCurrentIndex+tickSpacingI32 >= startTickIndexBase+ticksInArray
-		if shifted {
-			offsets = []int32{1, 2, 3}
+		// For negative numbers, ensure we floor towards negative infinity
+		realIndex = dividend / divisor
+		if dividend%divisor != 0 {
+			realIndex-- // Floor towards negative infinity
+		}
+	}
+	
+	startTickIndex := (realIndex + offset) * tickSpacing * TICK_ARRAY_SIZE
+
+	// Bounds check like official implementation but more lenient for edge cases
+	ticksInArray := TICK_ARRAY_SIZE * tickSpacing
+	minTickIndex := MIN_TICK - ((MIN_TICK%ticksInArray)+ticksInArray)
+
+	// Only validate bounds if they are severely out of range
+	// Allow some flexibility for edge cases as official implementation sometimes returns arrays
+	// that might be slightly out of normal bounds during sequence generation
+	maxBoundary := MAX_TICK + ticksInArray // Allow some buffer
+	minBoundary := minTickIndex - ticksInArray // Allow some buffer
+
+	if startTickIndex < minBoundary {
+		return 0, fmt.Errorf("startTickIndex is extremely out of bounds (too small) - %d (min boundary: %d)", startTickIndex, minBoundary)
+	}
+	if startTickIndex > maxBoundary {
+		return 0, fmt.Errorf("startTickIndex is extremely out of bounds (too large) - %d (max boundary: %d)", startTickIndex, maxBoundary)
+	}
+
+	return startTickIndex, nil
+}
+
+// DeriveMultipleWhirlpoolTickArrayPDAs derives multiple tick array PDA addresses
+// Based on official Whirlpool implementation
+// Reference: whirlpools/legacy-sdk/whirlpool/src/utils/swap-utils.ts:getTickArrayPublicKeysWithStartTickIndex
+func DeriveMultipleWhirlpoolTickArrayPDAs(whirlpoolPubkey solana.PublicKey, currentTick int64, tickSpacing int64, aToB bool) (tickArray0, tickArray1, tickArray2 solana.PublicKey, err error) {
+	// Apply shift like official implementation
+	var shift int64
+	if aToB {
+		shift = 0
+	} else {
+		// Per official Whirlpool SDK, shift by +tickSpacing for B->A
+		// TickUtil.getStartTickIndex(currentTick + tickSpacing)
+		shift = tickSpacing
+	}
+
+	tickArrayAddresses := make([]solana.PublicKey, 0, 3)
+	offset := int64(0)
+
+	// Generate up to 3 tick arrays like official implementation
+	// Follow official implementation: stop early if calculation fails
+	for i := 0; i < 3; i++ {
+		// Calculate start index using official algorithm
+		startIndex, err := getOfficialTickArrayStartIndex(currentTick+shift, tickSpacing, offset)
+		if err != nil {
+			// Like official implementation, stop generating more tick arrays on error
+			// but return what we have so far if we have at least one
+			if len(tickArrayAddresses) > 0 {
+				break
+			}
+			return solana.PublicKey{}, solana.PublicKey{}, solana.PublicKey{}, fmt.Errorf("failed to calculate startIndex for tick_array0: %w", err)
+		}
+
+		// Derive tick array PDA
+		tickArrayPDA, err := DeriveWhirlpoolTickArrayPDA(whirlpoolPubkey, startIndex)
+		if err != nil {
+			return solana.PublicKey{}, solana.PublicKey{}, solana.PublicKey{}, fmt.Errorf("failed to derive tick_array%d: %w", i, err)
+		}
+
+		tickArrayAddresses = append(tickArrayAddresses, tickArrayPDA)
+
+		// Update offset for next iteration
+		if aToB {
+			offset = offset - 1 // A->B: move to lower tick arrays
 		} else {
-			offsets = []int32{0, 1, 2}
+			offset = offset + 1 // B->A: move to higher tick arrays
 		}
 	}
 
-	// 4. Derive three tick array PDAs
-	startIndex0 := startTickIndexBase + offsets[0]*ticksInArray
-	tickArray0, err = DeriveWhirlpoolTickArrayPDA(whirlpoolPubkey, int64(startIndex0))
-	if err != nil {
-		return solana.PublicKey{}, solana.PublicKey{}, solana.PublicKey{}, fmt.Errorf("failed to derive tick_array0: %w", err)
+	// Ensure we have at least one tick array
+	if len(tickArrayAddresses) == 0 {
+		return solana.PublicKey{}, solana.PublicKey{}, solana.PublicKey{}, fmt.Errorf("failed to generate any valid tick arrays")
 	}
 
-	startIndex1 := startTickIndexBase + offsets[1]*ticksInArray
-	tickArray1, err = DeriveWhirlpoolTickArrayPDA(whirlpoolPubkey, int64(startIndex1))
-	if err != nil {
-		return solana.PublicKey{}, solana.PublicKey{}, solana.PublicKey{}, fmt.Errorf("failed to derive tick_array1: %w", err)
+	// Fill missing arrays with empty PublicKeys
+	for len(tickArrayAddresses) < 3 {
+		tickArrayAddresses = append(tickArrayAddresses, solana.PublicKey{})
 	}
 
-	startIndex2 := startTickIndexBase + offsets[2]*ticksInArray
-	tickArray2, err = DeriveWhirlpoolTickArrayPDA(whirlpoolPubkey, int64(startIndex2))
-	if err != nil {
-		return solana.PublicKey{}, solana.PublicKey{}, solana.PublicKey{}, fmt.Errorf("failed to derive tick_array2: %w", err)
-	}
-
-	return tickArray0, tickArray1, tickArray2, nil
+	return tickArrayAddresses[0], tickArrayAddresses[1], tickArrayAddresses[2], nil
 }
 
 // floorDivision implements integer division (floor), consistent with floor_division in Whirlpool source code
